@@ -7,6 +7,7 @@ the strings requested by the public API.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,10 @@ import numpy as np
 from ._lib import addr, lib
 
 HOM_REF, HET, UNKNOWN, HOM_ALT = 0, 1, 2, 3
+_DECODE_PARALLEL_THRESHOLD = 32_768
+_DECODE_CHUNK_SIZE = 16_384
+_DECODE_MAX_WORKERS = 8
+_DECODE_POOL = ThreadPoolExecutor(max_workers=_DECODE_MAX_WORKERS, thread_name_prefix="mojo-cyvcf2")
 
 
 class INFO(dict):
@@ -308,6 +313,7 @@ class VCF(Iterator[Variant]):
         else:
             self._sample_indices = list(range(len(header_samples)))
             self.samples = header_samples
+        self._all_samples_selected = self._sample_indices == list(range(len(header_samples)))
         self._scan()
         self._cursor = 0
 
@@ -332,11 +338,25 @@ class VCF(Iterator[Variant]):
         total = count * all_samples
         raw_alleles = np.empty(max(1, total * 3), dtype=np.int32)
         raw_types = np.empty(max(1, total), dtype=np.int32)
-        lib().mcv_decode_gt(addr(self._bytes), addr(self._starts), addr(self._ends), count,
-                            all_samples, int(self.strict_gt), addr(raw_alleles), addr(raw_types))
+        decode = lib().mcv_decode_gt
+        if count >= _DECODE_PARALLEL_THRESHOLD:
+            futures = []
+            for begin in range(0, count, _DECODE_CHUNK_SIZE):
+                chunk_records = min(_DECODE_CHUNK_SIZE, count - begin)
+                futures.append(_DECODE_POOL.submit(
+                    decode, addr(self._bytes), addr(self._starts) + begin * 8,
+                    addr(self._ends) + begin * 8, chunk_records, all_samples,
+                    int(self.strict_gt), addr(raw_alleles) + begin * all_samples * 3 * 4,
+                    addr(raw_types) + begin * all_samples * 4,
+                ))
+            for future in futures:
+                future.result()
+        else:
+            decode(addr(self._bytes), addr(self._starts), addr(self._ends), count,
+                   all_samples, int(self.strict_gt), addr(raw_alleles), addr(raw_types))
         decoded_alleles = raw_alleles[:total * 3].reshape(count, all_samples, 3)
         decoded_types = raw_types[:total].reshape(count, all_samples)
-        if self._sample_indices == list(range(all_samples)):
+        if self._all_samples_selected:
             self._alleles = decoded_alleles
             self._types = decoded_types
         else:
@@ -353,7 +373,7 @@ class VCF(Iterator[Variant]):
 
     def _variant(self, index: int) -> Variant:
         fields = self._data[int(self._starts[index]):int(self._ends[index])].decode("utf-8").split("\t")
-        if self._sample_indices != list(range(len(fields[9:]))):
+        if not self._all_samples_selected:
             fields = fields[:9] + [fields[9 + i] for i in self._sample_indices]
         return Variant(self, index, tuple(fields))
 

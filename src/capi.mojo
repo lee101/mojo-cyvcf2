@@ -22,19 +22,21 @@ def mcv_scan_records(src_addr: Int, n: Int, starts_addr: Int, ends_addr: Int, ca
     var i = 0
     comptime W = simd_width_of[DType.uint8]()
     while i + W <= n:
-        var bytes = src.load[width=W](i)
-        comptime for lane in range(W):
-            if bytes[lane] == 10:
-                var end = i + lane
-                if end > line_start and byte_at(src, line_start) != 35:
-                    if count < capacity:
-                        starts.store(count, line_start)
-                        if end > line_start and byte_at(src, end - 1) == 13:
-                            ends.store(count, end - 1)
-                        else:
-                            ends.store(count, end)
-                    count += 1
-                line_start = end + 1
+        var bytes = src.load[width=W, alignment=1](i)
+        var newlines = bytes.eq(UInt8(10))
+        if newlines.reduce_or():
+            comptime for lane in range(W):
+                if newlines[lane]:
+                    var end = i + lane
+                    if end > line_start and byte_at(src, line_start) != 35:
+                        if count < capacity:
+                            starts.store(count, line_start)
+                            if end > line_start and byte_at(src, end - 1) == 13:
+                                ends.store(count, end - 1)
+                            else:
+                                ends.store(count, end)
+                        count += 1
+                    line_start = end + 1
         i += W
     while i < n:
         if byte_at(src, i) == 10:

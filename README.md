@@ -60,9 +60,13 @@ pixi run bench
 Python reads the VCF once as a contiguous `uint8` buffer and passes its address
 to `dist/libmojo-cyvcf2.so` through `ctypes`. Mojo finds each non-header line,
 locates its first nine tab-delimited columns, and decodes leading `GT` fields.
-The ABI only exchanges integer addresses and lengths; all ownership remains on
-the Python side. Record positions are `int64` offset arrays, and decoded calls
-are a contiguous `(records, samples, 3)` `int64` array of
+The record scan uses unaligned SIMD loads, skips vectors with no newline, and
+finishes with a scalar tail. For at least 32,768 records, independent GT decode
+chunks run in a bounded CPU thread pool; smaller inputs stay serial. The ABI
+only exchanges integer addresses and lengths, so the threads operate directly
+on disjoint slices of the same NumPy buffers and all ownership remains on the
+Python side. Record positions are `int64` offset arrays, and decoded calls are
+a contiguous `(records, samples, 3)` `int32` array of
 `(allele_a, allele_b, phased)`. Python materializes strings only when a
 `Variant` is requested.
 
@@ -74,7 +78,7 @@ iterations.
 
 | case | mojo-cyvcf2 | cyvcf2 | ratio |
 | --- | ---: | ---: | ---: |
-| iterate + decode GT (200k x 8) | 930.0 ms | 1087.7 ms | 1.17x faster |
+| iterate + decode GT (200k x 8) | 851.9 ms | 1087.7 ms | 1.28x faster |
 
 This is an end-to-end compatibility benchmark, including Python-compatible
 `Variant` object creation and strings. On this run mojo-cyvcf2 is faster;

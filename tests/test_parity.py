@@ -114,6 +114,27 @@ def test_simd_scan_tail_and_compact_decoding(vcf_path):
     assert np.array_equal(ours[-1].gt_types, upstream[-1].gt_types)
 
 
+@pytest.mark.parametrize("records", [127, 32_769])
+def test_serial_and_parallel_decode_paths_match(records, tmp_path):
+    path = tmp_path / f"decode-{records}.vcf"
+    header = (
+        "##fileformat=VCFv4.2\n"
+        "##FORMAT=<ID=GT,Number=1,Type=String,Description=Genotype>\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tA\tB\tC\n"
+    )
+    rows = [
+        f"1\t{i + 1}\t.\tA\tG,T\t.\tPASS\t.\tGT\t0/0\t1|2\t./.\n"
+        for i in range(records)
+    ]
+    path.write_text(header + "".join(rows))
+    reader = mojo.VCF(path, strict_gt=True)
+    assert len(reader._starts) == records
+    assert reader._alleles[0].tolist() == [[0, 0, 0], [1, 2, 1], [-1, -1, 0]]
+    assert np.array_equal(reader._alleles[0], reader._alleles[-1])
+    assert reader._types[0].tolist() == [0, 1, 2]
+    assert np.array_equal(reader._types[0], reader._types[-1])
+
+
 def test_documented_variant_helpers_and_format_types(vcf_path):
     first, second, third = list(mojo.VCF(vcf_path))
     assert first.FILTERS == []
