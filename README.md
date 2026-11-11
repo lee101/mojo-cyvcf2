@@ -121,6 +121,46 @@ There are no floating-point reductions in these kernels, so this phase does not
 change summation order and no result differs from the previous build in any
 bit position.
 
+### SIMD phase
+
+`bench/analysis.md`, which this phase was meant to use as its worklist, does not
+exist in this repository and never has (no commit adds or removes it). The hot
+loops were therefore taken from the kernel source itself, and every candidate was
+judged by `pixi run bench` and by kernel timing with the pre-change library
+alternating in the same process.
+
+The kernels are already vectorised where it helps: `mcv_scan_records` compares a
+whole block at a time and reads line ends out of that same typed vector.
+Widening it further, or reshaping the passes that remain, did not move the
+caller-size numbers:
+
+| variant | scan before | scan after |
+| --- | ---: | ---: |
+| 32-byte block, lane indexing (whole-lane loop removal, guarded tail) | 8.63, 8.56, 8.59 ms | 8.72, 8.70, 8.74 ms |
+| same, with a bounded SIMD header skip | 8.32 ms | 8.50 ms |
+
+Three alternating-library runs, best of 15 rounds each: the scan measured
+0.98-0.99x (slightly slower) and the end-to-end case did not change
+(`pixi run bench` measured 649.8 ms before this phase, 676.0 ms in one run
+during it, within the 647-723 ms run-to-run spread noted above). Fusing the
+caller's newline count into the scan was also measured and dropped: it saves a
+7.45 ms NumPy pass but costs 10.51 ms against 9.07 ms for the scan alone.
+
+A fixed-width GT decoder shared one fatal shape with the general kernel, as could
+any scan/digit fast path: the kernels receive a bare address and a length, so a
+digit test that assumes a sample begins with a number decodes the digit before it
+when it does not. Restricting the fast path to single-digit calls and validating
+the whole layout up front removes that hazard, but the validation is itself a pass
+over the file; a vectorised layout check cost 19.86 ms, more than the kernel it
+would authorise. Machine-checkable rules for the shape would cost no pass, but
+matching a whole record's numeric skeleton together with genotype semantics is a
+separate piece of work, so none of it is shipped here.
+
+Nothing from this phase is in the tree: the scan is byte-for-byte the previous
+build, and `tests/test_simd_paths.py` was added to pin the existing scan and GT
+decode at lengths 0, 1, 31, 32, 33 and a large odd length, so any future SIMD
+change has to keep those exact. `tests` went from 11 to 36 tests.
+
 ## Compatibility testing
 
 The test suite installs the real PyPI `cyvcf2` package and asserts parity on a
