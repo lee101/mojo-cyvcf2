@@ -235,9 +235,68 @@ script was run directly (it only reads and times the generated file).
 byte for byte at 0, 1, 7, 4,097 and 40,000 records, strict and non-strict,
 awkward genotypes (haploid, polyploid, multi-digit, GT not leading), the
 threshold +/- one record through the public `VCF` API, and `threads=None/1/2/4/64`.
-`tests` went from 36 to 85 tests.
-
-## Compatibility testing
+	`tests` went from 36 to 85 tests.
+	
+	### GPU phase
+	
+	**CPU only: memory-bound.** No GPU kernel is shipped in this phase; this README
+	section is the deliverable.
+	
+	The gate conditions, checked in this checkout on 2026-11-11:
+	
+	| gate | requirement | measured | outcome |
+	| --- | --- | --- | --- |
+	| arithmetic intensity | above ~2 flops/byte | byte-driven kernels with zero floating-point work (see below) | fails - stop |
+	| shared GPU free memory | at least 4000 MiB | 5294 MiB (`nvidia-smi --query-gpu=memory.free`, RTX 5090, 60-70% utilised by other work) | passes |
+	| device allocation | under 2 GB | nothing allocated | n/a |
+	
+	`bench/analysis.md`, named above as the source of the flops-per-byte figures,
+	is not in this repository and never has been (no commit adds or removes it;
+	`bench/` holds `bench.py`, `kernel.py` and `parallel.py`). The intensity was
+	therefore counted from the kernels themselves in `src/capi.mojo`:
+	
+	- **`mcv_scan_records`**: per 32-byte block one `eq` on the byte vector and one
+	  `reduce_or`; at a newline, a header check and a CR check. About one integer
+	  compare per byte, and no multiply or accumulate anywhere in the loop.
+	- **`mcv_decode_gt`**: per sample, a scan for tabs and colons, then three byte
+	  compares for the common `a/b` / `a|b` call. The record is read about three
+	  times (column walk, FORMAT walk, sample walk), so the integer work per byte
+	  is a small constant, and again there is no floating-point operation.
+	
+	Both are branch- and memory-bound: they run at 3.0 GB/s (scan) and 0.7 GB/s
+	(decode) on a host whose memory streams at tens of GB/s, which is branchy
+	per-byte work rather than arithmetic a device could amortise a transfer
+	against. Zero flops per byte is below the ~2 flops/byte gate at every input
+	size, so no size could pay and, by the phase rules, no GPU code was written.
+	
+	Measured on the `pixi run bench` input (200,000 records x 8 samples,
+	26,378,142 bytes), kernel time only. "Before" is the phase start; "after" is
+	identical because nothing in `src/` changed:
+	
+	| kernel | before | after | change |
+	| --- | ---: | ---: | ---: |
+	| `mcv_scan_records` | 8.70-10.57 ms (3.0 GB/s) | same | none, no code change |
+	| `mcv_decode_gt` serial | 36.4-37.7 ms (0.70 GB/s) | same | none, no code change |
+	| `mcv_decode_gt_parallel` (3 workers) | 21.5 ms (1.2 GB/s) | same | none, no code change |
+	
+	The ranges are run-to-run spread on this shared host during the phase.
+	
+	For completeness, a throwaway probe outside the repository measured the shape
+	a GPU would have to run - a branchless whole-buffer scan, one thread per byte,
+	one upload, one launch, one copy-back - on the same machine. It found every
+	line start correctly (200,000 of 200,000 and 1,000,000 of 1,000,000 records on
+	generated input) and was 3.8-4.0x slower than the CPU scan at 6.3 MB, 39.5 MB
+	and 198 MB (50.5 ms against 10.6 ms at 39.5 MB), transfer included. That agrees
+	with the intensity gate in direction and in size, so it is not shipped, and no
+	number from the probe is claimed as a result here.
+	
+	The CPU path is unchanged and is the only path. No GPU tests were added, so no
+	GPU test was skipped, and nothing needs to skip on a CPU-only host. `pixi run
+	build && pixi run test` are both green after this phase: build exits 0 and the
+	suite reports `85 passed` (the same 85 as the PARALLEL phase, since no test
+	changed).
+	
+	## Compatibility testing
 
 The test suite installs the real PyPI `cyvcf2` package and asserts parity on a
 representative VCF for fields, INFO, FORMAT matrices, genotype states, strict
