@@ -8,7 +8,7 @@ comptime Int32Ptr = UnsafePointer[Int32, AnyOrigin[mut=True]]
 
 
 def byte_at(src: BytePtr, i: Int) -> Int:
-    return Int(src.load(i))
+    return Int(src.unsafe_load(i))
 
 
 @export("mcv_scan_records")
@@ -22,7 +22,7 @@ def mcv_scan_records(src_addr: Int, n: Int, starts_addr: Int, ends_addr: Int, ca
     var i = 0
     comptime W = simd_width_of[DType.uint8]()
     while i + W <= n:
-        var bytes = src.load[width=W, alignment=1](i)
+        var bytes = src.unsafe_load[width=W, alignment=1](i)
         var newlines = bytes.eq(UInt8(10))
         if newlines.reduce_or():
             comptime for lane in range(W):
@@ -121,8 +121,8 @@ def parse_allele(src: BytePtr, begin: Int, finish: Int, strict: Int, alleles: In
 
 
 def decode_record(src: BytePtr, starts: IntPtr, ends: IntPtr, r: Int, samples: Int, strict: Int, alleles: Int32Ptr, types: Int32Ptr):
-    var finish = ends.load(r)
-    var field_begin = starts.load(r)
+    var finish = ends.unsafe_load(r)
+    var field_begin = starts.unsafe_load(r)
     var format_begin = finish
     var format_end = finish
     var sample_begin = finish
