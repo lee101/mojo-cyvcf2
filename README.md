@@ -78,7 +78,13 @@ iterations.
 
 | case | mojo-cyvcf2 | cyvcf2 | ratio |
 | --- | ---: | ---: | ---: |
-| iterate + decode GT (200k x 8) | 851.9 ms | 1087.7 ms | 1.28x faster |
+| iterate + decode GT (200k x 8) | 647.1 ms | 1025.8 ms | 1.59x faster |
+
+End-to-end timing moves by tens of milliseconds between runs on this shared
+machine (repeated runs of the current build measured 647-723 ms for
+mojo-cyvcf2), so the table row is one run, not a best case. The compiled
+kernels are a small part of that total; per-record Python `Variant`
+construction dominates it.
 
 This is an end-to-end compatibility benchmark, including Python-compatible
 `Variant` object creation and strings. On this run mojo-cyvcf2 is faster;
@@ -88,6 +94,32 @@ Mojo scan and GT decode are real compiled kernels, not a selective
 microbenchmark. GPU execution is intentionally omitted: delimiter discovery
 and variable-width GT parsing are branch- and memory-bound, below the
 arithmetic intensity where transfer overhead can pay off.
+
+### Kernel time across the UNROLL phase
+
+Same 200k x 8 input, timing the two exported kernels directly with the
+pre-change and post-change shared libraries alternating in one process, best
+of 15 rounds (`bench/kernel.py` times the current build the same way):
+
+| kernel | before | after | change |
+| --- | ---: | ---: | ---: |
+| `mcv_scan_records` | 8.87 ms | 8.85 ms | unchanged |
+| `mcv_decode_gt` | 47.19 ms | 35.70 ms | 1.32x faster |
+| both | 56.06 ms | 44.55 ms | 1.26x faster |
+
+Both kernels produce byte-identical record bounds, alleles and gt types to the
+pre-change build; the decode change was checked against the previous library
+on the benchmark input plus randomised records with multi-digit and polyploid
+genotypes, haploid and missing calls, GT in a non-leading FORMAT position,
+absent FORMAT, CRLF input and records without a trailing newline, in both
+`strict_gt` modes. The gains come from hoisting the per-column state reads out
+of the byte loops and decoding the common one-digit diploid call (`.`, `a`,
+`a/b`, `a|b`) without the general accumulation loop. Scan-side micro-optimisations
+that `pixi run bench` did not show as faster were dropped rather than kept.
+
+There are no floating-point reductions in these kernels, so this phase does not
+change summation order and no result differs from the previous build in any
+bit position.
 
 ## Compatibility testing
 
