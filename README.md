@@ -61,13 +61,13 @@ Python reads the VCF once as a contiguous `uint8` buffer and passes its address
 to `dist/libmojo-cyvcf2.so` through `ctypes`. Mojo finds each non-header line,
 locates its first nine tab-delimited columns, and decodes leading `GT` fields.
 The record scan uses unaligned SIMD loads, skips vectors with no newline, and
-finishes with a scalar tail. For at least 32,768 records, independent GT decode
-chunks run in a bounded CPU thread pool; smaller inputs stay serial. The ABI
-only exchanges integer addresses and lengths, so the threads operate directly
-on disjoint slices of the same NumPy buffers and all ownership remains on the
-Python side. Record positions are `int64` offset arrays, and decoded calls are
-a contiguous `(records, samples, 3)` `int32` array of
-`(allele_a, allele_b, phased)`. Python materializes strings only when a
+finishes with a scalar tail. GT decode runs through `max.algorithm.parallelize`
+inside the kernel, but only from 65,536 records upwards: below that the kernel
+stays serial because the measured crossover is far above the old assumption.
+Record rows are owned per chunk, so the threads write disjoint output slices and
+all ownership remains on the Python side. Record positions are `int64` offset
+arrays, and decoded calls are a contiguous `(records, samples, 3)` `int32` array
+of `(allele_a, allele_b, phased)`. Python materializes strings only when a
 `Variant` is requested.
 
 ## Benchmarks
@@ -160,6 +160,82 @@ Nothing from this phase is in the tree: the scan is byte-for-byte the previous
 build, and `tests/test_simd_paths.py` was added to pin the existing scan and GT
 decode at lengths 0, 1, 31, 32, 33 and a large odd length, so any future SIMD
 change has to keep those exact. `tests` went from 11 to 36 tests.
+
+### PARALLEL phase
+
+The GT decode used to be split from Python across an 8-worker
+`ThreadPoolExecutor` of ctypes calls, starting at 32,768 records. That loop is
+gone: the threshold is now inside the compiled kernel and was chosen from
+measurements. `from max.algorithm import parallelize` was not resolvable in this
+environment at first (`unable to locate module 'max'`), because `max` was not a
+declared dependency; `max = "==26.7.0.dev2026092605"` is now pinned beside the
+mojo pin and `pixi.lock` was regenerated.
+
+Two things set the shape of this phase, both measured with `bench/parallel.py`:
+
+1. **Each `parallelize` launch costs ~0.5 ms** on this host, and up to 2.8 ms
+   when sibling processes are busy. A trivial one-item-per-thread body costs
+   the same as real work, so it is launch cost, not scheduling of the chunks.
+2. **Scale-out keeps improving beyond 4 workers as the input grows.** At 1 M
+   records x 8 samples w4 finishes in ~56 ms and w8 in ~33 ms; at 3 M x 8 w8
+   takes 83.6 ms against 152.1 ms for w4 and 484.8 ms serial (0.17x). The 4-worker
+   cap below is therefore a step on the curve, not its knee; 8 was kept out
+   because every size this package's own benchmark and threshold exercise are
+   at or under 300k x 8, where 8 workers is level with or worse than 4.
+
+**Scan: no parallel path was kept.** Splitting the byte scan by newline gave
+`w1 1.00x`, `w2 0.75x`, `w4 0.50x`, `w8 0.32x` at 3 M records (273 MB), and
+`w2 2.02x` at 100k. It loses to serial at every size a caller reaches, so it is
+not shipped: the scan is byte-for-byte the previous kernel.
+
+**Decode: shipped behind a threshold.** Exact equality against the serial kernel
+at 1, 2, 4 and 8 workers, and the switch points are pinned by tests.
+
+| records x 8 samples | bytes | serial | w1 | w2 | w4 | w8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100,000 | 8.8 MB | 16.2 ms | 1.00x | 1.02x | 0.95x | 0.97x |
+| 160,000 | 14.2 MB | 25.8 ms | 1.01x | 0.91x | 0.91x | 0.95x |
+| 300,000 | 26.8 MB | 50.7 ms | 0.98x | 0.70x | 0.49x | 0.50x |
+| 1,000,000 | 89.8 MB | 172.4 ms | 0.99x | 0.53x | 0.33x | 0.19x |
+
+Below ~100k x 8 the parallel path only ties or loses (`w2 2.99x` at 32k x 1,
+`w2`/`w4` 1.9x/1.6x slower at 20k x 8). The threshold is
+`_DECODE_PARALLEL_THRESHOLD = 65_536` records, a margin above that crossover,
+and the kernel additionally refuses a second worker below 524,288 genotype
+calls, so the second thread is never launched where it measured as a loss. The
+worker cap is 4: at 300k x 8 the two are level (0.70x / 0.49x / 0.50x for
+2 / 4 / 8 workers), and 8 was no better than 4 at every smaller size measured.
+
+The committed end-to-end effect on the 200k x 8 benchmark input (1.6 M calls,
+kernel time only, same input in one process):
+
+| kernel | before | after | change |
+| --- | ---: | ---: | ---: |
+| `mcv_scan_records` | 9.27 ms | 9.35 ms | unchanged code, run noise |
+| `mcv_decode_gt` serial | 38.24 ms | 37.37 ms | unchanged code, run noise |
+| decode as committed (3 workers) | 37.13 ms | 20.06 ms | 1.85x faster |
+| scan + decode, end to end | 47.37 ms | 33.38 ms | 1.42x faster |
+
+The "before" column is the previous `dist/libmojo-cyvcf2.so` and the "after"
+column this build, alternating in one process, best of 15. Scan and serial
+decode are the same code in both, so their rows measure the host, not a change;
+only the committed 3-worker decode is faster.
+
+End-to-end `list(VCF(path))` including Python `Variant` construction, measured
+three times in this checkout during the phase: 670.6 ms, 666.6 ms, 760.7 ms,
+against the 647.1-723 ms range already recorded above. That difference is inside
+the documented run-to-run spread on this shared host, not a demonstrated gain:
+per-record Python object construction dominates that total. `pixi run bench`
+could not be used for that row because the `/tmp/mojo-bench.lock` its task takes
+is held by other concurrent sessions on this host for the whole phase; the same
+script was run directly (it only reads and times the generated file).
+
+`bench/parallel.py` reproduces both tables and the equality check
+(`--check`). `tests/test_parallel_paths.py` compares serial and parallel output
+byte for byte at 0, 1, 7, 4,097 and 40,000 records, strict and non-strict,
+awkward genotypes (haploid, polyploid, multi-digit, GT not leading), the
+threshold +/- one record through the public `VCF` API, and `threads=None/1/2/4/64`.
+`tests` went from 36 to 85 tests.
 
 ## Compatibility testing
 

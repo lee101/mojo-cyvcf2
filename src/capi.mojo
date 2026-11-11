@@ -1,5 +1,6 @@
 """Hot VCF text scanning and GT decoding exposed through a small C ABI."""
 
+from max.algorithm import parallelize
 from std.sys import simd_width_of
 
 comptime BytePtr = Pointer[UInt8, AnyOrigin[mut=True]]
@@ -18,17 +19,17 @@ def byte_at(src: BytePtr, i: Int) -> Int:
     return Int(src.unsafe_load(i))
 
 
-@export("mcv_scan_records")
-def mcv_scan_records(src_addr: Int, n: Int, starts_addr: Int, ends_addr: Int, capacity: Int) abi("C") -> Int:
-    """Write byte ranges for non-header VCF lines and return their count."""
-    var src = BytePtr(unsafe_from_address=src_addr)
-    var starts = IntPtr(unsafe_from_address=starts_addr)
-    var ends = IntPtr(unsafe_from_address=ends_addr)
-    var line_start = 0
+def scan_range(src: BytePtr, lo: Int, hi: Int, starts: IntPtr, ends: IntPtr, capacity: Int) -> Int:
+    """Count non-header lines whose bytes are in [lo, hi) and write their ranges.
+
+    `lo` is a line boundary; `hi` is the end of the buffer or a newline byte,
+    which is excluded so a caller splitting the buffer can continue after it.
+    """
+    var line_start = lo
     var count = 0
-    var i = 0
+    var i = lo
     comptime W = simd_width_of[DType.uint8]()
-    while i + W <= n:
+    while i + W <= hi:
         var bytes = src.unsafe_load[width=W, alignment=1](i)
         var newlines = bytes.eq(LF)
         if newlines.reduce_or():
@@ -50,7 +51,7 @@ def mcv_scan_records(src_addr: Int, n: Int, starts_addr: Int, ends_addr: Int, ca
                         count += 1
                     line_start = end + 1
         i += W
-    while i < n:
+    while i < hi:
         if src.unsafe_load(i) == LF:
             if i > line_start and src.unsafe_load(line_start) != HASH:
                 if count < capacity:
@@ -62,15 +63,24 @@ def mcv_scan_records(src_addr: Int, n: Int, starts_addr: Int, ends_addr: Int, ca
                 count += 1
             line_start = i + 1
         i += 1
-    if line_start < n and src.unsafe_load(line_start) != HASH:
+    if line_start < hi and src.unsafe_load(line_start) != HASH:
         if count < capacity:
             starts.unsafe_store(count, line_start)
-            if src.unsafe_load(n - 1) == CR:
-                ends.unsafe_store(count, n - 1)
+            if src.unsafe_load(hi - 1) == CR:
+                ends.unsafe_store(count, hi - 1)
             else:
-                ends.unsafe_store(count, n)
+                ends.unsafe_store(count, hi)
         count += 1
     return count
+
+
+@export("mcv_scan_records")
+def mcv_scan_records(src_addr: Int, n: Int, starts_addr: Int, ends_addr: Int, capacity: Int) abi("C") -> Int:
+    """Write byte ranges for non-header VCF lines and return their count."""
+    var src = BytePtr(unsafe_from_address=src_addr)
+    var starts = IntPtr(unsafe_from_address=starts_addr)
+    var ends = IntPtr(unsafe_from_address=ends_addr)
+    return scan_range(src, 0, n, starts, ends, capacity)
 
 
 def allele_type(first: Int, second: Int, missing: Bool, index: Int, strict: Int) -> Int:
@@ -269,3 +279,55 @@ def mcv_decode_gt(src_addr: Int, starts_addr: Int, ends_addr: Int, records: Int,
     while r < records:
         decode_record(src, starts, ends, r, samples, strict, alleles, types)
         r += 1
+
+
+@export("mcv_decode_gt_parallel")
+def mcv_decode_gt_parallel(src_addr: Int, starts_addr: Int, ends_addr: Int, records: Int, samples: Int, strict: Int, alleles_addr: Int, types_addr: Int, workers: Int, min_records: Int) abi("C"):
+    """Decode records in parallel; each chunk writes only its own output rows.
+
+    Output slot `r * samples` is owned by whichever chunk holds record `r`, so
+    the result is identical to `mcv_decode_gt` regardless of scheduling.
+    `workers` is the exact thread count; a value below 2 stays serial. A record
+    count under `min_records` is decoded serially, which is what a caller does
+    below the kernel's measured crossover.
+    """
+    var src = BytePtr(unsafe_from_address=src_addr)
+    var starts = IntPtr(unsafe_from_address=starts_addr)
+    var ends = IntPtr(unsafe_from_address=ends_addr)
+    var alleles = Int32Ptr(unsafe_from_address=alleles_addr)
+    var types = Int32Ptr(unsafe_from_address=types_addr)
+    var worker_count = workers
+    if records < min_records:
+        worker_count = 1
+    elif samples > 0:
+        # The parallel path only paid off from ~1 M calls on this host, so the
+        # second thread is held back until then (see README crossover table).
+        comptime CALLS_PER_WORKER = 524_288
+        var allowed = (records * samples) // CALLS_PER_WORKER
+        if allowed < 2:
+            worker_count = 1
+        elif worker_count > allowed:
+            worker_count = Int(allowed)
+    if worker_count > records:
+        worker_count = records
+    if worker_count <= 1:
+        var r = 0
+        while r < records:
+            decode_record(src, starts, ends, r, samples, strict, alleles, types)
+            r += 1
+        return
+
+    var chunk = (records + worker_count - 1) // worker_count
+    var pieces = (records + chunk - 1) // chunk
+
+    def decode_chunk(p: Int) {imm}:
+        var begin = p * chunk
+        var stop = begin + chunk
+        if stop > records:
+            stop = records
+        var r = begin
+        while r < stop:
+            decode_record(src, starts, ends, r, samples, strict, alleles, types)
+            r += 1
+
+    parallelize(decode_chunk, pieces, worker_count)

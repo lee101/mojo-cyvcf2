@@ -15,6 +15,7 @@ I = ctypes.c_int64
 _SIGNATURES = {
     "mcv_scan_records": ([I, I, I, I, I], I),
     "mcv_decode_gt": ([I] * 8, None),
+    "mcv_decode_gt_parallel": ([I] * 9 + [I], None),
 }
 _loaded = None
 
